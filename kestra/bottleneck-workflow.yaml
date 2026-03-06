@@ -16,355 +16,371 @@ triggers:
     type: io.kestra.core.models.triggers.types.Schedule
     cron: "0 9 15 * *"
 
+
+# BLOCK 1 — DATA PREPARATION
+
 tasks:
+  - id: preparation_block
+    type: io.kestra.plugin.core.flow.Sequential
 
-  # 1 CLEAN + DEDOUBLONNAGE
+    tasks:
+      - id: dedup
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: python:3.11-slim
 
-  - id: dedup
-    type: io.kestra.plugin.scripts.shell.Commands
-    containerImage: python:3.11-slim
-    inputFiles:
-      erp.xlsx: "{{ inputs.erp }}"
-      web.xlsx: "{{ inputs.web }}"
-      liaison.xlsx: "{{ inputs.liaison }}"
-    retry:
-      type: constant
-      interval: PT5M
-      maxAttempt: 3
-    commands:
-      - pip install duckdb pandas openpyxl
-      - |
-        python3 - << 'EOF'
-        import duckdb
-        import pandas as pd
+        inputFiles:
+          erp.xlsx: "{{ inputs.erp }}"
+          web.xlsx: "{{ inputs.web }}"
+          liaison.xlsx: "{{ inputs.liaison }}"
 
-        con = duckdb.connect("bottleneck.db")
+        retry:
+          type: constant
+          interval: PT5M
+          maxAttempt: 3
 
-        erp = pd.read_excel('erp.xlsx')
-        web = pd.read_excel('web.xlsx')
-        liaison = pd.read_excel('liaison.xlsx')
+        commands:
+          - pip install duckdb pandas openpyxl
+          - |
+            python3 - << 'EOF'
+            import duckdb
+            import pandas as pd
 
-        # Normalisation colonnes
-        erp.columns = erp.columns.str.strip().str.lower()
-        web.columns = web.columns.str.strip().str.lower()
-        liaison.columns = liaison.columns.str.strip().str.lower()
+            con = duckdb.connect("bottleneck.db")
 
-        # Nettoyage
-        erp = erp.dropna(subset=["product_id"]).drop_duplicates(subset=["product_id"])
-        liaison = liaison.dropna(subset=["product_id"])
-        liaison = liaison.drop_duplicates(subset=["product_id", "id_web"])
-        web = web.dropna(subset=["sku"])
+            erp = pd.read_excel("erp.xlsx")
+            web = pd.read_excel("web.xlsx")
+            liaison = pd.read_excel("liaison.xlsx")
 
-        # Normalisation clés
-        erp["product_id"] = erp["product_id"].astype(str).str.strip().str.lower()
-        liaison["product_id"] = liaison["product_id"].astype(str).str.strip().str.lower()
-        liaison["id_web"] = liaison["id_web"].astype(str).str.strip().str.lower()
-        web["sku"] = web["sku"].astype(str).str.strip().str.lower()
+            erp.columns = erp.columns.str.strip().str.lower()
+            web.columns = web.columns.str.strip().str.lower()
+            liaison.columns = liaison.columns.str.strip().str.lower()
 
-        con.register("erp_df", erp)
-        con.execute("CREATE OR REPLACE TABLE erp_clean AS SELECT * FROM erp_df")
+            erp = erp.dropna(subset=["product_id"]).drop_duplicates(subset=["product_id"])
+            liaison = liaison.drop_duplicates(subset=["product_id","id_web"])
+            web = web.dropna(subset=["sku"])
 
-        con.register("liaison_df", liaison)
-        con.execute("CREATE OR REPLACE TABLE liaison_clean AS SELECT * FROM liaison_df")
+            erp["product_id"] = erp["product_id"].astype(str).str.strip().str.lower()
+            liaison["product_id"] = liaison["product_id"].astype(str).str.strip().str.lower()
+            liaison["id_web"] = liaison["id_web"].astype(str).str.strip().str.lower()
+            web["sku"] = web["sku"].astype(str).str.strip().str.lower()
 
-        con.register("web_df", web)
-        con.execute("CREATE OR REPLACE TABLE web_clean AS SELECT * FROM web_df")
+            con.register("erp_df", erp)
+            con.execute("CREATE OR REPLACE TABLE erp_clean AS SELECT * FROM erp_df")
 
-        print("ERP:", len(erp))
-        print("LIAISON:", len(liaison))
-        print("WEB:", len(web))
-        EOF
-    outputFiles:
-      - bottleneck.db
+            con.register("liaison_df", liaison)
+            con.execute("CREATE OR REPLACE TABLE liaison_clean AS SELECT * FROM liaison_df")
 
-  # 2 TEST CLEAN
+            con.register("web_df", web)
+            con.execute("CREATE OR REPLACE TABLE web_clean AS SELECT * FROM web_df")
 
-  - id: test_clean
-    type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
-    inputFiles:
-      bottleneck.db: "{{ outputs.dedup.outputFiles['bottleneck.db'] }}"
-    beforeCommands:
-      - pip install duckdb
-    script: |
-      import duckdb
-      con = duckdb.connect("bottleneck.db")
+            print("Data cleaned")
+            EOF
 
-      erp = con.execute("SELECT COUNT(*) FROM erp_clean").fetchone()[0]
-      liaison = con.execute("SELECT COUNT(*) FROM liaison_clean").fetchone()[0]
+        outputFiles:
+          - bottleneck.db
 
-      if erp != 825:
-          raise Exception(f"ERP incorrect: {erp}")
-      if liaison != 825:
-          raise Exception(f"Liaison incorrect: {liaison}")
+      - id: test_clean
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: python:3.11-slim
 
-      print(" Clean validé")
+        inputFiles:
+          bottleneck.db: "{{ outputs.dedup.outputFiles['bottleneck.db'] }}"
 
-  # 3 FUSION
+        beforeCommands:
+          - pip install duckdb
+        allowFailure: true
+        script: |
+          import duckdb
+          con = duckdb.connect("bottleneck.db")
 
-  - id: fusion
-    type: io.kestra.plugin.scripts.shell.Commands
-    containerImage: python:3.11-slim
-    inputFiles:
-      bottleneck.db: "{{ outputs.dedup.outputFiles['bottleneck.db'] }}"
-    retry:
-      type: constant
-      interval: PT5M
-      maxAttempt: 3
-    commands:
-      - pip install duckdb
-      - |
-        python3 - << 'EOF'
-        import duckdb
-        con = duckdb.connect("bottleneck.db")
+          erp = con.execute("SELECT COUNT(*) FROM erp_clean").fetchone()[0]
+          liaison = con.execute("SELECT COUNT(*) FROM liaison_clean").fetchone()[0]
 
-        con.execute("""
-        CREATE OR REPLACE TABLE web_agg AS
-        SELECT sku, MAX(total_sales) as total_sales
-        FROM web_clean
-        GROUP BY sku
-        """)
+          if erp != 825:
+              raise Exception(f"ERP incorrect: {erp}")
 
-        con.execute("""
-        CREATE OR REPLACE TABLE full_data AS
-        SELECT
-            e.product_id,
-            e.price,
-            w.total_sales
-        FROM erp_clean e
-        INNER JOIN liaison_clean l ON e.product_id = l.product_id
-        INNER JOIN web_agg w ON l.id_web = w.sku
-        """)
-        EOF
-    outputFiles:
-      - bottleneck.db
+          if liaison != 825:
+              raise Exception(f"Liaison incorrect: {liaison}")
 
-  # 4 TEST FUSION
+          print("Clean validation OK")
 
-  - id: test_fusion
-    type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
-    inputFiles:
-      bottleneck.db: "{{ outputs.fusion.outputFiles['bottleneck.db'] }}"
-    beforeCommands:
-      - pip install duckdb
-    script: |
-      import duckdb
-      con = duckdb.connect("bottleneck.db")
-
-      rows = con.execute("SELECT COUNT(*) FROM full_data").fetchone()[0]
-
-      if rows != 714:
-          raise Exception(f"Fusion incorrecte: {rows}")
-
-      print(" Fusion validée")
-
-  # 5 TEST CA
+    errors:
+      - id: alert_clean_error
+        type: io.kestra.plugin.core.log.Log
+        message: " Erreur dans le bloc préparation des données"
 
 
-  - id: test_ca
-    type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
-    inputFiles:
-      bottleneck.db: "{{ outputs.fusion.outputFiles['bottleneck.db'] }}"
-    beforeCommands:
-      - pip install duckdb
-    outputFiles:
-      - result.json
+# BLOCK 2 — DATA FUSION
 
-    script: |
-      import duckdb
-      import json
-      import os
+  - id: fusion_block
+    type: io.kestra.plugin.core.flow.Sequential
 
-      con = duckdb.connect("bottleneck.db")
+    tasks:
+      - id: fusion
+        type: io.kestra.plugin.scripts.shell.Commands
+        containerImage: python:3.11-slim
 
-      ca = con.execute("SELECT ROUND(SUM(price * total_sales),2) FROM full_data").fetchone()[0]
-      print(json.dumps({"ca": float(ca)}))
-      if round(ca,2) != 70568.60:
-          raise Exception(f"CA incorrect: {ca}")
+        inputFiles:
+          bottleneck.db: "{{ outputs.dedup.outputFiles['bottleneck.db'] }}"
+        allowFailure: true
+        commands:
+          - pip install duckdb
+          - |
+            python3 - << 'EOF'
+            import duckdb
 
-      print("CA validé")
-      # Écriture des outputs pour Kestra
-      with open("result.json", "w") as f:
-        json.dump({"ca": ca}, f)
+            con = duckdb.connect("bottleneck.db")
 
-  - id: extract_ca
-    type: io.kestra.plugin.core.log.Log
-    message: "Fichier result.json généré avec succès"
+            con.execute("""
+            CREATE OR REPLACE TABLE web_agg AS
+            SELECT sku, MAX(total_sales) as total_sales
+            FROM web_clean
+            GROUP BY sku
+            """)
 
-  # 6 Z-SCORE + CLASSIFICATION
+            con.execute("""
+            CREATE OR REPLACE TABLE full_data AS
+            SELECT
+              e.product_id,
+              e.price,
+              w.total_sales
+            FROM erp_clean e
+            INNER JOIN liaison_clean l
+              ON e.product_id = l.product_id
+            INNER JOIN web_agg w
+              ON l.id_web = w.sku
+            """)
+            EOF
 
-  - id: zscore
-    type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
-    inputFiles:
-      bottleneck.db: "{{ outputs.fusion.outputFiles['bottleneck.db'] }}"
-    beforeCommands:
-      - pip install duckdb pandas numpy
-    script: |
-      import duckdb, pandas as pd, numpy as np
+        outputFiles:
+          - bottleneck.db
 
-      con = duckdb.connect("bottleneck.db")
-      df = con.execute("SELECT * FROM full_data").fetchdf()
+      - id: test_fusion
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: python:3.11-slim
 
-      mean = df["price"].mean()
-      std = df["price"].std()
+        inputFiles:
+          bottleneck.db: "{{ outputs.fusion.outputFiles['bottleneck.db'] }}"
 
-      df["z_score"] = (df["price"] - mean) / std
-      df["type"] = np.where(df["z_score"] > 2, "premium", "ordinaire")
+        beforeCommands:
+          - pip install duckdb
 
-      df.to_csv("classified.csv", index=False)
+        script: |
+          import duckdb
+          con = duckdb.connect("bottleneck.db")
 
-      premium_count = (df["type"]=="premium").sum()
+          rows = con.execute("SELECT COUNT(*) FROM full_data").fetchone()[0]
 
-      if premium_count != 30:
-          raise Exception(f"Nb premium incorrect: {premium_count}")
+          if rows != 714:
+              raise Exception(f"Fusion incorrecte: {rows}")
 
-      print(" Z-score validé")
+          print("Fusion OK")
 
-    outputFiles:
-      - classified.csv
-
-  # 7 SPLIT PREMIUM / ORDINAIRE
-
-
-  - id: split
-    type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
-    inputFiles:
-      classified.csv: "{{ outputs.zscore.outputFiles['classified.csv'] }}"
-    beforeCommands:
-      - pip install pandas
-    script: |
-      import pandas as pd
-
-      df = pd.read_csv("classified.csv")
-
-      df[df["type"]=="premium"].to_csv("premium.csv", index=False)
-      df[df["type"]=="ordinaire"].to_csv("ordinaire.csv", index=False)
-
-    outputFiles:
-      - premium.csv
-      - ordinaire.csv
-
-  # 8 EXPORT EXCEL
+    errors:
+      - id: alert_fusion_error
+        type: io.kestra.plugin.core.log.Log
+        message: "⚠️ Erreur dans la fusion des datasets"
 
 
-  - id: export_excel
-    type: io.kestra.plugin.scripts.python.Script
-    containerImage: python:3.11-slim
-    inputFiles:
-      bottleneck.db: "{{ outputs.fusion.outputFiles['bottleneck.db'] }}"
-    retry:
-      type: constant
-      interval: PT5M
-      maxAttempt: 3
-    allowFailure: true
-    beforeCommands:
-      - pip install duckdb pandas openpyxl
-    script: |
-      import duckdb
-      import pandas as pd
-      import os
+# BLOCK 3 — ANALYSIS
 
-      # Vérification transmission fichier
-      if "bottleneck.db" not in os.listdir("."):
-          raise Exception("bottleneck.db non transmis")
+  - id: analysis_block
+    type: io.kestra.plugin.core.flow.Sequential
 
-      con = duckdb.connect("bottleneck.db")
+    tasks:
+      - id: test_ca
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: python:3.11-slim
 
-      df = con.execute("""
-          SELECT product_id,
-                 SUM(total_sales) AS quantity,
-                 price,
-                 SUM(price * total_sales) AS revenue
+        inputFiles:
+          bottleneck.db: "{{ outputs.fusion.outputFiles['bottleneck.db'] }}"
+
+        beforeCommands:
+          - pip install duckdb
+
+        script: |
+          import duckdb
+
+          con = duckdb.connect("bottleneck.db")
+
+          ca = con.execute(
+            "SELECT ROUND(SUM(price * total_sales),2) FROM full_data"
+          ).fetchone()[0]
+
+          print("CA =", ca)
+
+          if round(ca,2) != 70568.60:
+              raise Exception(f"CA incorrect: {ca}")
+
+          print("CA validé")
+
+      - id: zscore
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: python:3.11-slim
+
+        inputFiles:
+          bottleneck.db: "{{ outputs.fusion.outputFiles['bottleneck.db'] }}"
+
+        beforeCommands:
+          - pip install duckdb pandas numpy
+
+        script: |
+          import duckdb
+          import pandas as pd
+          import numpy as np
+
+          con = duckdb.connect("bottleneck.db")
+          df = con.execute("SELECT * FROM full_data").fetchdf()
+
+          mean = df["price"].mean()
+          std = df["price"].std()
+
+          df["z_score"] = (df["price"] - mean) / std
+          df["type"] = np.where(df["z_score"] > 2, "premium", "ordinaire")
+
+          df.to_csv("classified.csv", index=False)
+
+          premium = (df["type"] == "premium").sum()
+
+          if premium != 30:
+              raise Exception(f"Premium incorrect: {premium}")
+
+        outputFiles:
+          - classified.csv
+
+    errors:
+      - id: alert_analysis_error
+        type: io.kestra.plugin.core.log.Log
+        message: "⚠️ Erreur dans l'analyse statistique"
+
+# BLOCK 4 — REPORTING
+
+
+  - id: reporting_block
+    type: io.kestra.plugin.core.flow.Sequential
+
+    tasks:
+      - id: split
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: python:3.11-slim
+        inputFiles:
+          classified.csv: "{{ outputs.zscore.outputFiles['classified.csv'] }}"
+        beforeCommands:
+          - pip install pandas
+        script: |
+          import pandas as pd
+
+          df = pd.read_csv("classified.csv")
+
+          df[df["type"]=="premium"].to_csv("premium.csv", index=False)
+          df[df["type"]=="ordinaire"].to_csv("ordinaire.csv", index=False)
+
+        outputFiles:
+          - premium.csv
+          - ordinaire.csv
+      - id: export_excel
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: python:3.11-slim
+
+        inputFiles:
+          bottleneck.db: "{{ outputs.fusion.outputFiles['bottleneck.db'] }}"
+
+        allowFailure: true
+
+        beforeCommands:
+          - pip install duckdb pandas openpyxl
+
+        script: |
+          import duckdb
+          import pandas as pd
+
+          con = duckdb.connect("bottleneck.db")
+
+          df = con.execute("""
+          SELECT
+            product_id,
+            price,
+            total_sales,
+            price * total_sales as revenue
           FROM full_data
-          GROUP BY product_id, price
-      """).fetchdf()
+          """).fetchdf()
 
-      total = df["revenue"].sum()
+          with pd.ExcelWriter("rapport.xlsx") as writer:
+              df.to_excel(writer, sheet_name="CA", index=False)
 
-      # Vérification cohérence métier
-      if round(total, 2) != 70568.60:
-          raise Exception(f"CA incorrect : {total}")
+          print("Excel généré")
 
-      with pd.ExcelWriter("rapport.xlsx") as writer:
-          df.to_excel(writer, sheet_name="CA_produit", index=False)
-          pd.DataFrame({"CA_total": [total]}).to_excel(writer, sheet_name="Total", index=False)
+        outputFiles:
+          - rapport.xlsx
 
-      print("Export Excel OK")
+      - id: fake_email_success
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ tasks.test_ca.state == 'SUCCESS' }}"
 
-    outputFiles:
-      - rapport.xlsx
+        script: |
+          print("📧 ===============================")
+          print("De : Pipeline Kestra")
+          print("À : bottleneck.laurent@proton.me")
+          print("Sujet : Bottleneck Pipeline SUCCESS")
+          print("")
+          print("Bonjour Laurent,")
+          print("")
+          print("Le pipeline d'analyse mensuelle s'est terminé avec succès.")
+          print("")
+          print("Synthèse des résultats :")
+          print("- Produits réconciliés : 714")
+          print("- Vins Premium détectés : 30")
+          print("- Chiffre d'Affaires Total : 70,568.60 €")
+          print("")
+          print("Veuillez trouver ci-joint le rapport global (Excel)")
+          print("ainsi que les extractions par catégorie (CSV).")
+          print("")
+          print("📎 Pièces jointes :")
+          print("Rapport-Excel : {{ outputs.export_excel.outputFiles['rapport.xlsx'] }}")
+          print("vin-Premium : {{ outputs.split.outputFiles['premium.csv'] }}")
+          print("vin-Ordinaires : {{ outputs.split.outputFiles['ordinaire.csv'] }}")
+          print("📧 ===============================")
 
-  - id: fake_email_success
-    type: io.kestra.plugin.scripts.python.Script
-    runIf: "{{ tasks.test_ca.state == 'SUCCESS' }}"
-    script: |
-      print("📧 ===============================")
-      print("De : Pipeline Kestra")
-      print("À : bottleneck.laurent@proton.me")
-      print("Sujet : Bottleneck Pipeline SUCCESS")
-      print("")
-      print("Bonjour Laurent,")
-      print("")
-      print("Le pipeline d'analyse mensuelle s'est terminé avec succès.")
-      print("")
-      print("Synthèse des résultats :")
-      print("- Produits réconciliés : 714")
-      print("- Vins Premium détectés : 30")
-      print("- Chiffre d'Affaires Total : 70,568.60 €")
-      print("")
-      print("Veuillez trouver ci-joint le rapport global (Excel)")
-      print("ainsi que les extractions par catégorie (CSV).")
-      print("")
-      print("📎 Pièces jointes :")
-      print("Rapport-Excel : {{ outputs.export_excel.outputFiles['rapport.xlsx'] }}")
-      print("vin-Premium : {{ outputs.split.outputFiles['premium.csv'] }}")
-      print("vin-Ordinaires : {{ outputs.split.outputFiles['ordinaire.csv'] }}")
-      print("📧 ===============================")
+      - id: fallback_csv
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ tasks.export_excel.state != 'SUCCESS' }}"
+        script: |
+          import pandas as pd
 
-  - id: fallback_csv
-    type: io.kestra.plugin.scripts.python.Script
-    runIf: "{{ tasks.export_excel.state != 'SUCCESS' }}"
-    script: |
-      import pandas as pd
+          df = pd.read_csv("ca_final.csv")
+          df.to_csv("rapport_backup.csv", index=False)
+ 
+          print("Fallback CSV généré")    
 
-      df = pd.read_csv("ca_final.csv")
-      df.to_csv("rapport_backup.csv", index=False)
-
-      print("Fallback CSV généré")    
-
-  - id: fake_email_failure
-    type: io.kestra.plugin.scripts.python.Script
-    runIf: "{{ tasks.test_ca.state == 'FAILED' }}"
-    script: |
-      print("📧 ===========================================")
-      print("De : Pipeline Kestra")
-      print("À : bottleneck.laurent@proton.me")
-      print("Sujet : [ALERTE] Bottleneck Pipeline - ECHEC VALIDATION CA")
-      print("")
-      print("Bonjour Laurent,")
-      print("")
-      print("Le pipeline d'analyse mensuelle s'est terminé,")
-      print("mais une anomalie a été détectée lors de la validation métier.")
-      print("")
-      print("Détails de l'anomalie :")
-      print(f"- CA calculé : {{ outputs.test_ca.vars.ca }} €")
-      print("- CA attendu : 70 568.60 €")
-      print("- Statut : ECHEC VALIDATION")
-      print("")
-      print("Une procédure de secours (fallback CSV) a été déclenchée")
-      print("afin de garantir la continuité du reporting.")
-      print("")
-      print("Actions recommandées :")
-      print("- Vérifier la cohérence des données sources (ERP / WEB)")
-      print("- Contrôler les jointures et agrégations")
-      print("- Relancer le pipeline si nécessaire")
-      print("")
-      print("Execution ID :", "{{ execution.id }}")
-      print("")
-      print("Cordialement,")
-      print("Pipeline Data Engineering - Kestra")
-      print("📧 ===========================================")  
+      - id: fake_email_failure
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ tasks.test_ca.state == 'FAILED' }}"
+        script: |
+          print("📧 ===========================================")
+          print("De : Pipeline Kestra")
+          print("À : bottleneck.laurent@proton.me")
+          print("Sujet : [ALERTE] Bottleneck Pipeline - ECHEC VALIDATION CA")
+          print("")
+          print("Bonjour Laurent,")
+          print("")
+          print("Le pipeline d'analyse mensuelle s'est terminé,")
+          print("mais une anomalie a été détectée lors de la validation métier.")
+          print("")
+          print("Détails de l'anomalie :")
+          print(f"- CA calculé : {{ outputs.test_ca.vars.ca }} €")
+          print("- CA attendu : 70 568.60 €")
+          print("- Statut : ECHEC VALIDATION")
+          print("")
+          print("Une procédure de secours (fallback CSV) a été déclenchée")
+          print("afin de garantir la continuité du reporting.")
+          print("")
+          print("Actions recommandées :")
+          print("- Vérifier la cohérence des données sources (ERP / WEB)")
+          print("- Contrôler les jointures et agrégations")
+          print("- Relancer le pipeline si nécessaire")
+          print("")
+          print("Execution ID :", "{{ execution.id }}")
+          print("")
+          print("Cordialement,")
+          print("Pipeline Data Engineering - Kestra")
+          print("📧 ===========================================")  

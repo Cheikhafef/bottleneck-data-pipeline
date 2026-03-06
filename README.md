@@ -91,4 +91,15 @@ Cette architecture garantit :
 - une automatisation complète du reporting
 - une détection fiable des vins premium
 - une résilience en cas d’erreur (fallback, retry, alertes)
-- une traçabilité totale via Kestra
+- une traçabilité totale via Kestra <BR>
+
+## 🚨 6. Gestion des erreurs & Alertes
+Kestra intègre un système d’alertes à chaque étape critique du pipeline.
+L’objectif est simple : détecter, signaler et isoler les erreurs sans bloquer toute la chaîne.
+
+✔ Comment ça fonctionne ?<br>
+ * Chaque bloc (CLEAN, FUSION, ANALYSIS, REPORTING) possède un test de validation.
+ * Si un test échoue → une alerte dédiée est déclenchée.
+ * Le pipeline continue grâce à allowFailure: true.
+ * L’erreur apparaît clairement dans l’UI Kestra (carré rouge).
+ * Une task d’alerte enregistre un message explicite dans les logs.
